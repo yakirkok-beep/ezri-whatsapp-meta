@@ -364,6 +364,33 @@ def handle_message(phone, text):
         conversation_history[phone] = []
         return greeting_prefix + MAIN_MENU
 
+    # 10 = רשימת דמויות התנועה (מתוך knowledge_extra.json)
+    if text == "10":
+        figures = KNOWLEDGE_EXTRA.get("movement_figures", [])
+        if not figures:
+            return greeting_prefix + "אין מידע זמין על דמויות התנועה כרגע."
+        msg = "👥 *דמויות התנועה*\n\nבחר דמות ללמידה עליה:\n\n"
+        for i, fig in enumerate(figures, 1):
+            msg += f"{i}️⃣ *{fig.get('name', '')}*\n"
+            msg += f"   _{fig.get('role', '')}_\n\n"
+        msg += "כתוב את שם הדמות או את המספר שלה ואני אביא לך מידע מעמיק.\n\n"
+        msg += "כתוב *0* לתפריט ראשי"
+        return greeting_prefix + msg
+
+    # 11 = נושאי הועידה (מתוך knowledge_extra.json)
+    if text == "11":
+        conf = KNOWLEDGE_EXTRA.get("conference_2026", {})
+        topics = conf.get("topics", [])
+        if not topics:
+            return greeting_prefix + "אין מידע זמין על הועידה כרגע."
+        msg = f"📚 *{conf.get('title', 'ועידת התנועה')}*\n"
+        msg += f"_{conf.get('tagline', '')}_\n\n"
+        msg += "בחר נושא להעמיק בו:\n\n"
+        for i, topic in enumerate(topics, 1):
+            msg += f"{i}️⃣ *{topic.get('name', '')}*\n"
+        msg += "\nכתוב את שם הנושא או את המספר שלו.\n\n"
+        msg += "כתוב *0* לתפריט ראשי"
+        return greeting_prefix + msg
     # Greetings = main menu + clear history
     if text.lower() in GREETINGS or text in GREETINGS:
         conversation_history[phone] = []
