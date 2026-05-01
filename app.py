@@ -2,6 +2,7 @@ import os
 import requests
 import json
 import time
+from datetime import date, datetime
 from flask import Flask, request
 
 import anthropic
@@ -18,12 +19,94 @@ GRAPH_API_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # === CONVERSATION MEMORY ===
-# Stores only the last exchange per user (not cumulative)
 conversation_history = {}
 MAX_HISTORY = 10
 
+# === מעקב אחרי משתמשים שכבר קיבלו ברכת שבוע תנועה (פעם אחת בשבוע) ===
+movement_week_greeted = set()
+
+
+# ============================================================
+# טעינת מאגר הידע הנוסף (דמויות, ועידה, שבוע תנועה)
+# ============================================================
+
+KNOWLEDGE_EXTRA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "knowledge_extra.json"
+)
+
+
+def load_knowledge_extra():
+    """טוען את קובץ ה-JSON של התוכן הנוסף"""
+    try:
+        with open(KNOWLEDGE_EXTRA_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"[WARN] knowledge_extra.json not found at {KNOWLEDGE_EXTRA_PATH}")
+        return {}
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Invalid JSON: {e}")
+        return {}
+
+
+KNOWLEDGE_EXTRA = load_knowledge_extra()
+
+
+def is_movement_week():
+    """בודק אם היום בתוך שבוע התנועה"""
+    mw = KNOWLEDGE_EXTRA.get("movement_week", {})
+    if not mw.get("active"):
+        return False
+    try:
+        start = datetime.strptime(mw["start_date"], "%Y-%m-%d").date()
+        end = datetime.strptime(mw["end_date"], "%Y-%m-%d").date()
+        return start <= date.today() <= end
+    except (KeyError, ValueError):
+        return False
+
+
+def get_movement_week_greeting():
+    """מחזיר את ברכת שבוע התנועה"""
+    if not is_movement_week():
+        return ""
+    return KNOWLEDGE_EXTRA.get("movement_week", {}).get("greeting", "")
+
+
+def build_extra_context_for_claude():
+    """מחזיר טקסט להוסיף ל-system prompt"""
+    context = "\n\n=== מידע נוסף לעזרי ===\n\n"
+
+    conf = KNOWLEDGE_EXTRA.get("conference_2026", {})
+    if conf:
+        context += f"## ועידת התנועה הנוכחית: {conf.get('title', '')}\n"
+        context += f"{conf.get('description', '')}\n\n"
+        context += "נושאי הועידה:\n"
+        for topic in conf.get("topics", []):
+            context += f"- {topic['name']}: {topic.get('summary', '')}\n"
+        context += "\n"
+
+    figures = KNOWLEDGE_EXTRA.get("movement_figures", [])
+    if figures:
+        context += "## דמויות מרכזיות בתנועה:\n"
+        for fig in figures:
+            context += f"\n### {fig['name']} ({fig.get('years', '')})\n"
+            context += f"תפקיד: {fig.get('role', '')}\n"
+            if fig.get("core_principles"):
+                context += "עקרונות מרכזיים:\n"
+                for p in fig["core_principles"][:3]:
+                    context += f"- {p}\n"
+            if fig.get("connection_to_ezra"):
+                context += f"קשר לעזרא: {fig['connection_to_ezra']}\n"
+
+    if is_movement_week():
+        context += "\n## שים לב: השבוע הוא שבוע התנועה!\n"
+        context += "השתדל לחבר תשובות לרוח שבוע התנועה ולנושאי הועידה.\n"
+
+    return context
+
+
 # === SYSTEM PROMPT ===
-SYSTEM_PROMPT = """אתה *עזרי* – מדריך ותיק ומנוסה בתנועת עזרא, שתמיד שמח לעזור לקולגות שלו.
+SYSTEM_PROMPT_BASE = """אתה *עזרי* – מדריך ותיק ומנוסה בתנועת עזרא, שתמיד שמח לעזור לקולגות שלו.
 אתה מדבר כמו חבר טוב שגם במקרה יודע הכל על התנועה – חם, ישיר, עם הומור קל, ובלי להתנשא.
 אתה כותב בעברית טבעית ומדויקת, בגובה העיניים של מדריכים צעירים (גילאי 16-20).
 
@@ -139,6 +222,8 @@ SYSTEM_PROMPT = """אתה *עזרי* – מדריך ותיק ומנוסה בתנ
 7️⃣ 🧠 חידון / טריוויה
 8️⃣ ✉️ ניסוח הודעה
 9️⃣ 💬 שאלה חופשית
+🔟 👥 דמויות התנועה
+1️⃣1️⃣ 📚 ועידת התנועה
 
 או פשוט *כתוב מה אתה צריך* ✍️
 כתוב *0* לתפריט ראשי
@@ -154,6 +239,8 @@ SYSTEM_PROMPT = """אתה *עזרי* – מדריך ותיק ומנוסה בתנ
 - 7 = שאל קבוצת גיל ונושא, ותן חידון עם 5 שאלות
 - 8 = שאל למי ההודעה ומה התוכן, ונסח
 - 9 = מצב שאלה חופשית
+- 10 = הצג רשימת דמויות תנועה ושאל על איזו ללמוד
+- 11 = הצג מידע על הועידה והנושאים, ושאל באיזה נושא להעמיק
 - 0 = הצג תפריט ראשי
 
 == חשוב: תמיד השתמש במספרים לבחירה ==
@@ -181,6 +268,9 @@ SYSTEM_PROMPT = """אתה *עזרי* – מדריך ותיק ומנוסה בתנ
 תמיד סיים עם: כתוב *0* לתפריט ראשי
 המשתמש יענה במספר ואתה תדע לאיזו אפשרות הוא מתכוון על פי ההקשר של השיחה.
 """
+
+# הוספת ההקשר הנוסף (דמויות + ועידה) ל-system prompt
+SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + build_extra_context_for_claude()
 
 
 # === SEND MESSAGE VIA META CLOUD API ===
@@ -218,7 +308,6 @@ def get_ai_response(phone, user_message):
 
     conversation_history[phone].append({"role": "user", "content": user_message})
 
-    # Keep only last N messages to save memory
     if len(conversation_history[phone]) > MAX_HISTORY:
         conversation_history[phone] = conversation_history[phone][-MAX_HISTORY:]
 
@@ -253,6 +342,8 @@ MAIN_MENU = """🔵⚪ *שלום, אני עזרי!*
 7️⃣ 🧠 חידון / טריוויה
 8️⃣ ✉️ ניסוח הודעה
 9️⃣ 💬 שאלה חופשית
+🔟 👥 דמויות התנועה
+1️⃣1️⃣ 📚 ועידת התנועה
 
 או פשוט *כתוב מה אתה צריך* ✍️
 כתוב *0* לתפריט ראשי"""
@@ -262,33 +353,39 @@ def handle_message(phone, text):
     """Process incoming message and return response."""
     text = text.strip()
 
+    # === ברכת שבוע התנועה — פעם ראשונה בשבוע לכל משתמש ===
+    greeting_prefix = ""
+    if is_movement_week() and phone not in movement_week_greeted:
+        greeting_prefix = get_movement_week_greeting()
+        movement_week_greeted.add(phone)
+
     # 0 = main menu + clear history
     if text == "0":
         conversation_history[phone] = []
-        return MAIN_MENU
+        return greeting_prefix + MAIN_MENU
 
     # Greetings = main menu + clear history
     if text.lower() in GREETINGS or text in GREETINGS:
         conversation_history[phone] = []
-        return MAIN_MENU
+        return greeting_prefix + MAIN_MENU
 
     # Help/menu
     if text in {"עזרה", "תפריט", "help", "menu"}:
-        return MAIN_MENU
+        return greeting_prefix + MAIN_MENU
 
     # Reset
     if text in {"אפס", "מחק", "reset"}:
         conversation_history[phone] = []
-        return "🔄 מתחילים מחדש!\n\n" + MAIN_MENU
+        return greeting_prefix + "🔄 מתחילים מחדש!\n\n" + MAIN_MENU
 
     # Everything else goes to Claude with history
-    return get_ai_response(phone, text)
+    response = get_ai_response(phone, text)
+    return greeting_prefix + response
 
 
 # === WEBHOOK VERIFICATION (GET) ===
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    """Meta webhook verification endpoint."""
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -304,13 +401,11 @@ def verify_webhook():
 # === WEBHOOK HANDLER (POST) ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Handle incoming WhatsApp messages from Meta Cloud API."""
     data = request.json
     if not data:
         return "ok", 200
 
     try:
-        # Only process message entries
         if data.get("object") != "whatsapp_business_account":
             return "ok", 200
 
@@ -318,13 +413,11 @@ def webhook():
             for change in entry.get("changes", []):
                 value = change.get("value", {})
 
-                # SKIP status updates (read receipts, delivered, etc.)
                 if "statuses" in value and "messages" not in value:
                     return "ok", 200
 
                 messages = value.get("messages", [])
                 for message in messages:
-                    # Only handle text messages
                     if message.get("type") != "text":
                         continue
 
@@ -349,11 +442,14 @@ def webhook():
 # === HEALTH CHECK ===
 @app.route("/", methods=["GET"])
 def home():
-    return "🔵⚪ עזרי WhatsApp Bot - פעיל!"
+    movement_week_status = "🎉 שבוע תנועה פעיל!" if is_movement_week() else ""
+    return f"🔵⚪ עזרי WhatsApp Bot - פעיל! {movement_week_status}"
 
 
 # === RUN ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("🔵⚪ עזרי WhatsApp Bot (Meta Cloud API) מופעל!")
+    if is_movement_week():
+        print("🎉 שבוע התנועה פעיל - ברכות יישלחו אוטומטית!")
     app.run(host="0.0.0.0", port=port)
